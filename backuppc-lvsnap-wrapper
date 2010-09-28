@@ -1,0 +1,275 @@
+#!/usr/bin/perl
+# This script attempts to verify that only rsync with the --server parameter
+# is run.  It also tries to catch and reject several attempts at redirects.
+# I'm sure it's not perfect, but it's better than allowing any command to
+# run.
+
+# Where will your chroot be located?
+my $chroot_dir="/mnt/snapback";
+
+# We will check how To check how many mounts were mounted  <-TODO: make this better!
+# This way we can tell if lvsnap had an error, or if the 
+# mounts just already mounted 
+my $mounts_under_chroot=3;
+
+# services to stop before lvm snapshot and start afterwards
+my @services=qw(mysql postgresql);
+
+# Use debug mode. This currently only displays a 'rejected' output instead
+# of nothing. BackupPC will know if there is an error (no files transfered),
+# so there is little point in showing a reject message. 
+# 0 - No rejected message and exit with 0. Unauthorized access is still logged.
+# 1 - Display "Rejected" on unauthorized access and exit with 1.
+my $debug=0;
+
+# To test, this is one method you can use (on the same machine as the script)
+# First, in a shell, set the SSH_ORIGINAL_COMMAND to the command you want to test
+# Keep in mind this command will be run like normal, so be careful
+#    export SSH_ORIGINAL_COMMAND="restorecontext rsync /etc/mtab"
+# Then run this script with no arguments. Remember
+#    /usr/local/bin/backuppc-lvsnap-wrapper
+# You will see exactly what ssh will see, and be able to view logs of actions
+#    tail /var/log/messages
+
+#############################################################################
+
+# TODO
+
+# siplify by having outside scripts that are run
+# startup
+# finsh
+# trap kills all child processes, and runs finish script, and exits
+
+# have a white list of all programs that can be run
+# sounds like sudo, but easier to configure?
+
+# restorecon sub should be able to handle files with not ""?
+# depends on how backuppc passes them 
+
+# add a password phrase that would be verified on access, ie
+# $accesscode="kfo84md023mf0vkdckgie";
+# only allow alphanumeric characters
+# BIG CON!: if someone gets the 
+# warn user that this is just *another* layer, and should not be relied on
+# this may require an access locking mechinism, so someone could not 
+# try to do an mem overflow on the program (option to disable lock)
+# thus, it would be: access > lock > verify code > unlock
+# lock on itself, or on config file
+
+use strict;
+# It is nice to be able to log all attempts to access the machine. However,
+# passing args directly to a command line program like 'logger' may destroy
+# the system, just by logging it, as the shell will execute anything
+# in the arguments *before* it hands it over to logger. If there is some
+# terrible command in there, like ones encoded in  normal charachers, 
+# escapes and ascii, say goodbye to files, disks, networks, etc.
+# So, we use this perl module since it only gives the data to syslog.
+# It will never execute it.
+use Sys::Syslog;
+
+# app vars
+my $program="BackupPC-wrapper";
+$ENV{PATH}="/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/usr/local/sbin";
+
+# case "$SSH_ORIGINAL_COMMAND" in
+# Get ssh command
+my $ssh_command=$ENV{SSH_ORIGINAL_COMMAND};
+
+sub log_it {
+    my $message="";
+    foreach (@_) { $message=$message." ".$_; }
+    $message=substr($message,1);
+    # no perror, as rsync talks back to server by stdout
+    openlog($program, "nofatal,pid", "local0");
+    syslog("info", $message);
+    closelog();
+}
+
+sub log_exit {
+    log_it(@_);
+    exit 1;
+}
+
+sub restart_services {
+    my $init="/etc/init.d";
+    my @s=@_;
+    foreach (@s) {
+        if ( -x "$init/$_" ) {
+	    # services return 0 for running or 3 for stopped
+	    system ( "$init/$_ status >/dev/null 2>$1");
+	    if  ( $? == 0 ) {
+	        system("$init/$_ condrestart >/dev/null 2>$1");
+	        log_it "Restarted $_";
+	    }
+        }
+    }
+}
+
+sub close_rsync {
+    local $SIG{HUP} = 'IGNORE';
+    log_it "Caught signal";
+    log_it -$$;
+    kill HUP => -$$;
+    sleep 2;
+    log_it -$$;
+    # snazzy writing of: kill('HUP', -$$)
+}
+
+sub reject_connection {
+    my $message = shift;
+    log_it $message;
+    if ( $debug == 1 ) {
+	print "Rejected\n";
+        exit 1;
+    }
+    else {
+	exit 0;
+    }
+}
+
+if ( $ssh_command =~ m/[\&\(\{\;\<\`\>\\]+/ ) {
+    # reject according to $debug, and log why
+    reject_connection("Rejected command due to bad character: $ssh_command");
+}
+
+if ( $ssh_command =~ m|^/usr/bin/rsync --server.*| ) {
+		# Since backups are done against snapshots, while restores,
+		# should take place directly on the filesystem, I needed a way to 
+		# determine if this is a backup or a restore.  To accomplish this
+		# I add the benign option "--timeout=0" to the rsync restore command
+		# options defined in BackupPC then simply check for this option in
+		# the command string sent from the server.  If it finds the "--timeout=0"
+		# string it simply runs the command as sent directly on the filesystem.
+		# Otherwise it creates and mounts the LVM snapshots and runs the command
+		# in the chroot environment.
+
+		if ( $ssh_command =~ m/.*--timeout=0.*/ ) {
+			# This is a restore, no chroot, just run the orginal rsync command
+			log_it("Restoring files: $ssh_command");
+		        system($ssh_command);
+		}
+		else {
+			log_it("Doing backup: $ssh_command");
+                        # This is a backup, start the snapshots, change root, then run the rsync command
+			mkdir $chroot_dir || log_exit "Failed to create $chroot_dir";
+		        # flush data (should we stop them, snapshot, and then start em?
+		        restart_services(@services);
+                        system("sync");
+                        # lvm snapshot
+		        system("lvsnap start >/dev/null 2>&1");
+			if ( $? != 0 ) {
+			    # lvsnap failed. check for all mounts, and continue if all ok
+			    log_it "lvsnap start failed. Checking...";
+			    open(TAB,"/proc/mounts") || log_exit "Cannot open /proc/mounts";
+			    my @mounts=grep(/$chroot_dir/, <TAB>);
+			    close(TAB);
+			    my $num_mounts=$#mounts + 1;
+			    if ( $num_mounts < $mounts_under_chroot ) {
+				log_exit("Not enough drives were mounted. Wanted $mounts_under_chroot but only got $num_mounts. Backup Failed");
+			    }
+			    log_it "Everything was fine";
+	                }
+		        # bring back services
+		        # start_services(@services);
+                        # trap signals
+		        $SIG{INT}  = \&close_rsync;
+		        $SIG{HUP}  = \&close_rsync;
+		        $SIG{TERM} = \&close_rsync;
+                        $SIG{ALRM} = \&close_rsync;
+                        $SIG{PIPE} = \&close_rsync;
+                        $SIG{STOP} = \&close_rsync;
+                        $SIG{TSTP} = \&close_rsync;
+                        $SIG{TTIN} = \&close_rsync;
+                        # do backup
+		        log_it "Starting backup";
+			system("chroot $chroot_dir $ENV{SSH_ORIGINAL_COMMAND}");
+		        # check, and if failed do vlsnap stop and then exit
+                        my $exit_val=$?;
+		        if ( $exit_val != 0 ) {
+			    log_it "Rsync exited with error $exit_val";
+			}
+		        else {
+			    log_it "Rsync finished successfully";
+		        }
+		        $SIG{INT} = '';
+		        $SIG{HUP} = '';
+		        $SIG{TERM} = '';
+		        system("lvsnap stop >/dev/null 2>&1");
+		        if ( $? != 0 ) { log_exit "'lvsnap stop' failed: $?"; }
+                        rmdir $chroot_dir; # safe bacause command cannot do a recursive removal
+		        log_it("Backup completed");
+                }
+		exit 0;
+}
+
+# 'hack' to restore selinux context(s)
+if ( $ssh_command =~ m/^restorecontext rsync .*/ ) {
+    my $ret_val;
+    # first, is selinux active on this machine?
+    my $do_restore=1;
+    if ( not -e "/selinux/enforce" ) {
+        # yes, that's it. even in permissive mode we should do it
+	# rejecting or error may be unwise.
+	# it would tell the person if selinux was running
+	# so we will go through the motions, but not do anything
+	$do_restore=0;
+    }	
+    my @files=split( / / , $ENV{SSH_ORIGINAL_COMMAND});
+    shift @files;
+    shift @files;
+    my @restored=();
+    my @failed_restore=("FAILED to fix Selinux context of: ");
+    my @do_not_exist=("Supposably restored files that DO NOT EXIST: ");
+    foreach my $file (@files) {
+	if ( not -e $file ) {
+	    push @do_not_exist, $file;
+	    if ( $debug == 1 ) {
+		print "File does not exist: $file\n";
+	    }
+	    next;
+	}
+	if ( $do_restore == 0 ) {
+	    push @restored, $file;
+	    next;
+	}
+        # file by file, due to possible arg length limit
+	system("restorecon -RF \"$file\" >/dev/null 2>&1");
+	if ( $? == 0 ) {
+	    push @restored, $file;
+	} else {
+	    push @failed_restore, $file;
+	    if ( $debug == 1 ) {
+		# If debug is set, print info back to BackupPC
+		# This is a security vulnurablility, as an attacker
+		# can get a full file list of the system.
+		# Of course, they can with rsync, but...
+		print "Failed to fix Selinux context of $file\n";
+	    }
+	}
+    }
+    if ( $do_restore == 0 ) {
+	log_it "Did not fix Selinux contexts: it was not loaded";
+    }
+    if ( $#restored != $#files ) {
+	unshift @restored, "File restored: ";
+	if ( $do_restore == 1 ) {
+	    log_it "Fixing of some or all SELinux contexts failed";
+	} else {
+	    # this corresponds to the above "I did not fix..."
+	    log_it "However, here are some restored files that were not found, which should be useful";
+	}
+#	log_it(@restored)        if ( $#restored > 0 );
+	log_it(@failed_restore)  if ( $#failed_restore > 0 );
+	log_it(@do_not_exist)    if ( $#do_not_exist > 0 );
+	$ret_val=1;
+    }
+    else {
+	log_it "Successfully fixed Selinux contexts of requested files"; 
+	$ret_val=0;
+    }
+    exit $ret_val;
+}
+	    
+
+# otherwise, reject according to $debug, and log why
+reject_connection("Rejected unknown command: $ssh_command");
