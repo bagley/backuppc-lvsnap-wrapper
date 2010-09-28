@@ -4,23 +4,66 @@
 # I'm sure it's not perfect, but it's better than allowing any command to
 # run.
 
-# Where will your chroot be located?
+# version: Sept 28, 2010
+
+# look for backuppc-lvsnap-wrapper.conf in these dirs
+# use the first one found
+my @config_dirs = qw(/usr/local/etc /etc);
+
+# Defaults (Do NOT change these here. Change them in the 
+# /etc/backuppc-lvsnap-wrapper.conf file).
+
+# Comments are mainly for developer.
+
+# Chroot
 my $chroot_dir="/mnt/snapback";
+my $snapshot_program="lvsnap";
+my $mounts_under_chroot=-1;
 
-# We will check how To check how many mounts were mounted  <-TODO: make this better!
-# This way we can tell if lvsnap had an error, or if the 
-# mounts just already mounted 
-my $mounts_under_chroot=3;
+# Services
+my $stop_services='';
+my $init="/etc/init.d";
 
-# services to stop before lvm snapshot and start afterwards
-my @services=qw(mysql postgresql);
+# MySQL
+my $mysql_user='';
+my $mysql_pass='';
+# dump (1), lock(0)
+my $mysql_dump=1;
+# compress with what? '' to disable.
+my $mysql_compress='';
+# where to save it.
+my $mysql_dump_file='';
 
-# Use debug mode. This currently only displays a 'rejected' output instead
-# of nothing. BackupPC will know if there is an error (no files transfered),
-# so there is little point in showing a reject message. 
-# 0 - No rejected message and exit with 0. Unauthorized access is still logged.
-# 1 - Display "Rejected" on unauthorized access and exit with 1.
+# PgSQL
+my $pgsql_user='';
+my $pgsql_pass='';
+# dump (1), lock(0)
+my $pgsql_dump=1;
+# compress with what? '' to disable.
+my $pgsql_compress='';
+# where to save it.
+my $pgsql_dump_file='';
+
+# External
+# before all
+my $pre_run = "";
+# after all
+my $post_run = "";
+
+# Checks
+#  rsync command must pass this, or reject
+my $rsync_regex='^/usr/bin/rsync --server.*';
+#  check for shell escapes
+my $check_command_line=1;
+# check regex
+my $check_regex = '[\\\[\]\&\(\{\}\;\<\>`]+';
+
+# Debug (0=no message, 1='rejected')
 my $debug=0;
+
+# app vars
+my $program="BackupPC-wrapper";
+$ENV{PATH}="/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/usr/local/sbin";
 
 # To test, this is one method you can use (on the same machine as the script)
 # First, in a shell, set the SSH_ORIGINAL_COMMAND to the command you want to test
@@ -57,6 +100,7 @@ my $debug=0;
 # lock on itself, or on config file
 
 use strict;
+
 # It is nice to be able to log all attempts to access the machine. However,
 # passing args directly to a command line program like 'logger' may destroy
 # the system, just by logging it, as the shell will execute anything
@@ -65,15 +109,46 @@ use strict;
 # escapes and ascii, say goodbye to files, disks, networks, etc.
 # So, we use this perl module since it only gives the data to syslog.
 # It will never execute it.
+
 use Sys::Syslog;
 
-# app vars
-my $program="BackupPC-wrapper";
-$ENV{PATH}="/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/usr/local/sbin";
+use File::Temp qw/ tempfile /;
 
-# case "$SSH_ORIGINAL_COMMAND" in
+use Fcntl qw(:flock);
+
+# load config
+my $config_return;
+my $config = "";
+foreach (@config_dirs) {
+    $config = $_."/backuppc-lvsnap-wrapper.conf";
+    last if ( -f $config );
+}
+die "could not find config: $config" if ( not -f $config );
+
+if ( not $config_return = do $config ) {
+    die "couldn't parse $config: $@" if $@;
+    die "couldn't do $config: $!" unless defined $config_return;
+    # warn "couldn't run $config" unless $return;
+}
+
 # Get ssh command
 my $ssh_command=$ENV{SSH_ORIGINAL_COMMAND};
+
+# format services
+my @services=split(/,/ , $stop_services);
+
+# chroot or not
+my $use_chroot=0;
+if ( length($chroot_dir) > 0 and $chroot_dir =~ m|^/.*| ) {
+    $use_chroot=1;
+#    log_print "Using a chroot";
+# }
+# else {
+#    log_print "Not using a chroot";
+}
+
+###########
+# logging
 
 sub log_it {
     my $message="";
@@ -85,34 +160,311 @@ sub log_it {
     closelog();
 }
 
+sub log_print {
+    log_it(@_);
+    foreach (@_) {
+	print "$_\n";
+    }
+}
+
 sub log_exit {
     log_it(@_);
+    do_cleanup();
     exit 1;
 }
 
-sub restart_services {
-    my $init="/etc/init.d";
-    my @s=@_;
+##########
+# services
+
+sub services {
+    my ($action,@s)=@_;
     foreach (@s) {
         if ( -x "$init/$_" ) {
-	    # services return 0 for running or 3 for stopped
-	    system ( "$init/$_ status >/dev/null 2>$1");
-	    if  ( $? == 0 ) {
-	        system("$init/$_ condrestart >/dev/null 2>$1");
-	        log_it "Restarted $_";
+	    system ( "$init/$_ $action >/dev/null 2>&1");
+	    if ( $? >> 8 eq 0 ) {
+		log_it "Completed a $action of $_";
+	    }
+	    else {
+		log_it "Failed to do a $action of $_";
 	    }
         }
     }
 }
 
-sub close_rsync {
-    local $SIG{HUP} = 'IGNORE';
-    log_it "Caught signal";
-    log_it -$$;
-    kill HUP => -$$;
-    sleep 2;
-    log_it -$$;
-    # snazzy writing of: kill('HUP', -$$)
+############
+# databases
+
+# so we can always make a connection
+sub db_connect {
+    my ($db,$user,$pass)=@_;
+    if ( length($user) == 0 ) {
+#	log_it "No database user give for $db. Skipping.";
+	return 0;
+    }
+    # so those without this module will be okay to still do backups
+    use DBI;
+    my $dbh = DBI->connect_cached($db, $user, $pass);
+    if ( $dbh->err ) {
+       log_it "Failed to connect to $db: ".$dbh->errstr;
+       return 0;
+    }
+    return $dbh;
+}
+
+sub mysql_lock {
+    return if ($mysql_user eq "" or $mysql_dump eq 1 );
+    log_it("locking mysql database");
+    
+    my $myh=db_connect('DBI:mysql:dbname=mysql', $mysql_user, $mysql_pass);
+    return if ($myh eq 0 );
+    if ( $myh->do("FLUSH TABLES WITH READ LOCK") ) {
+       log_it "Locked tables on mysql database";
+    }
+    else {
+       log_it "Failed to lock tables on mysql database: ".$myh->errstr;
+       return;
+    }
+}
+
+# mysql unlock
+sub mysql_unlock {
+    return if ($mysql_user eq "" or $mysql_dump eq 1 );
+    log_it("unlocking mysql database");
+    
+    my $myh=db_connect('DBI:mysql:dbname=mysql', $mysql_user, $mysql_pass);
+    return if ($myh eq 0 );
+    if ( $myh->do("UNLOCK TABLES") ) {
+       log_it "Released lock on mysql database";
+    }
+    else {
+       log_it "Failed to release lock on mysql database: ".$myh->errstr;
+       # what to do...
+       # restart mysql
+       # send mail
+       return;
+    }
+}
+
+# pgsql has an internal snapshot call
+sub pgsql_lock {
+    return if ($pgsql_user eq "" or $pgsql_dump eq 1 );
+    log_it("locking pgsql database");
+    
+    my $pgh=db_connect('DBI:Pg:dbname=postgres', $pgsql_user, $pgsql_pass);
+    return if ($pgh eq 0 );
+    if ( $pgh->do("SELECT pg_start_backup('backuppc_snapshot');") ) {
+       log_it "Created snapshot on pgsql database";
+    }
+    else {
+       log_it "Failed to create snapshot on pgsql database: ".$pgh->errstr;
+       return;
+    }
+}
+
+# postgres unlock
+sub pgsql_unlock {
+    return if ($pgsql_user eq "" or $pgsql_dump eq 1 );
+    log_it("unlocking pgsql database");
+    
+    my $pgh=db_connect('DBI:Pg:dbname=postgres', $pgsql_user, $pgsql_pass);
+    return if ($pgh eq 0 );
+    if ( not $pgh->do("SELECT pg_stop_backup();") ) {
+       log_it "Released snapshot on pgsql database";
+    }
+    else {
+       log_it "Failed to release snapshot on pgsql database: ".$pgh->errstr;
+       return;
+    }
+}
+
+
+# dump database of pgsql to file
+sub pg_dump {
+    return if ($pgsql_user eq "" or $pgsql_dump eq 0 );
+    
+    # set UNLINK just in case pg_dumpall goes crazy
+    my ($fh, $passfile) = tempfile( "pgpass.backuppc.XXXXXXXXXXXXXXX", TMPDIR => 1, UNLINK => 1 );
+    
+    # my $passfile=$ENV{HOME}."/.pgpass-backuppc";
+    # open(my $fh,">",$passfile);
+    
+    # pgpass file, instead of .pgpass: format is '*:*:*:user:password'
+    print $fh "*:*:*:$pgsql_user:$pgsql_pass";
+    chmod 0600, $passfile;
+    close($fh);
+    # create a secure file for dump
+    open(BAC,">",$pgsql_dump_file)  || die "cannot open or create $pgsql_dump_file: $!";
+    close(BAC);
+    # TODO: pg_dumpall (and dump_file) should be run as postgres, but this is system specific
+    # [would have to figure out pgsql's user]
+    system("chown","root:root",$pgsql_dump_file);
+    chmod 0600, $pgsql_dump_file;
+    # dump
+    log_it "Dumping pgsql database to $pgsql_dump_file";
+    $ENV{PGPASSFILE}=$passfile;
+    # PGPASSFILE=$passfile
+    my $pgexit;
+    if ( $pgsql_compress eq "" ) {
+	$pgexit=`pg_dumpall -U \"$pgsql_user\" -w > \"$pgsql_dump_file\" ; echo $?`;
+    }
+    else {
+	# ugly, but allows us to check both piped commands, rather than just the last
+        $pgexit=`pg_dumpall -U \"$pgsql_user\" -w | $pgsql_compress > \"$pgsql_dump_file\" ; expr \$(echo \${PIPESTATUS[\@]} | sed 's/ / + /g')`;
+	# $pgexit=`echo okay | $pgsql_compress > \"$pgsql_dump_file\" ; expr \$(echo \${PIPESTATUS[\@]} | sed 's/ / + /g')`;
+    }
+    # did it work?
+    # $pgexit=$? >> 8 if( $? >> 8 != 0 );
+    chomp $pgexit;
+    if ( $pgexit eq 0 ) {
+	log_it "Finished dumping pgsql database.";
+    }
+    else {
+	print "Failed to dump pgsql database. Exit code $pgexit.";
+	log_exit "Failed to dump pgsql database. Exit code $pgexit.";
+    }
+    
+    # we dont need pgpass anymore (we really dont have to do this, but just to be safe)
+    close($fh);
+    unlink($passfile);
+}
+
+sub pg_dump_cleanup {
+    return if ($pgsql_user eq "" or $pgsql_dump eq 0 );
+    
+    unlink $pgsql_dump_file;
+
+}
+
+##############
+# cleanup
+
+sub do_cleanup {
+    
+    my $sig=shift;
+    
+    log_it "Cleaning up";
+    
+    # send HUP to all child processes [ snazzy writing of: kill('HUP', -$$) ]
+    # without the IGNORE, the parent (us) gets signalled too
+    if ( kill 0 => -$$ ) {
+	log_it("killing child processes -$$");
+	local $SIG{HUP} = 'IGNORE';
+        kill HUP => -$$;
+        sleep 2;
+        local $SIG{TERM} = 'IGNORE';
+        kill TERM => -$$;
+    }
+    # stop lvm, dumps, etc
+    if ( $use_chroot ) {
+	system("$snapshot_program stop >/dev/null 2>&1");
+        if ( $? >> 8 != 0 ) {
+	    log_it "running \'$snapshot_program stop\' failed with code: ".$? >> 8;
+            # sendmail(); 
+	    system("echo $snapshot_program stop failed | mail -s Failure root");
+        }
+    	rmdir $chroot_dir; # safe bacause command cannot do a recursive removal
+    }
+    # services
+    services('start',@services);
+    # databases
+    mysql_unlock();
+    pgsql_unlock();
+    pg_dump_cleanup();
+    
+    # post run
+    if ($post_run ne "" ) {
+        log_it "Running post-run: $post_run";
+        system($post_run);
+    }
+    
+    # remove lock
+    # we could do it here, but may a well just close program and be done with it
+    
+    # to exit, or not to exit...
+    if ( $sig eq "INT" or $sig eq "HUP" or $sig eq "TERM" or $sig eq "ALRM" ) {
+        # do not use log_exit, as it will loop
+	log_print "Exiting due to signal $sig";
+	exit 1;
+    }
+}
+
+#################
+# selinux reset contexts (for file restore)
+
+# 'hack' to restore selinux context(s), but the best we can do
+# until backuppc supports xattr.
+if ( $ssh_command =~ m/^restorecontext rsync .*/ ) {
+    
+    # tag all printed msgs with this
+    my $selinux_tag="[SELinux reset context] ";
+    
+    # first, is selinux active on this machine?
+    if ( not -e "/selinux/enforce" ) {
+	if ( $debug == 1 ) {
+	    print "$selinux_tag selinux was not loaded. nothing to restore\n";
+	}
+	exit 0;
+    }
+    # Yes, that's it. Even in permissive mode we should do it, since
+    #  while it won't deny actions, it will create a lot of
+    #  avc denials, which is bad on our part since we could have prevented it.
+    
+    # log that we are doing it (for large restores, user may wonder
+    # why it is taking so long. I'm talking full system restores).
+    log_print("restoring selinux contexts for files");
+    print "Only errors will be shown\n" if ( $debug == 0 );
+    
+    # file list
+    my @reset_files=split( / / , $ENV{SSH_ORIGINAL_COMMAND});
+    # get rid of first two args: 'restorecontext rsync /file1 /file2 /file...'
+    shift @reset_files;
+    shift @reset_files;
+    # track total success / fails
+    my $restore_success=0;
+    my $restore_fails=0;
+    foreach my $reset_file (@reset_files) {
+	if ( not -e $reset_file ) {
+	    print "$selinux_tag File does not exist: $reset_file\n";
+	    next;
+	}
+        # one by one, due to possible arg length limit. no output by default
+	system("restorecon","-RF",$reset_file);
+	if ( $? >> 8 == 0 ) {
+	    $restore_success+=1;
+	    print "$selinux_tag Reset context for $reset_file\n" if ( $debug == 1 );
+	} else {
+	    $restore_fails+=1;
+	    print "$selinux_tag Error: Failed to fix Selinux context of $reset_file\n";
+	}
+    }
+    # log how it went
+    if ( $restore_fails == 0 ) {
+	log_print "$selinux_tag Sucessfully reset contexts of $restore_success files/folders";
+    }
+    else {
+	log_print "$selinux_tag Error: Failed to reset contexts ($restore_success succeeded, $restore_fails failed)";
+	exit 1;
+    }
+    # nothing left to do
+    exit 0;
+}
+
+
+###################
+# checks and reject
+
+# exits if not enough mounts
+sub check_mounts {
+    
+    return if ( $mounts_under_chroot == -1 );
+    
+    open(TAB,"/proc/mounts") || log_exit "Cannot open /proc/mounts";
+    my @mounts=grep(/$chroot_dir/, <TAB>);
+    close(TAB);
+    my $num_mounts=$#mounts + 1;
+    if ( $num_mounts != $mounts_under_chroot ) {
+	log_exit("Not enough drives were mounted. Wanted $mounts_under_chroot but only got $num_mounts. Backup Failed");
+    }
 }
 
 sub reject_connection {
@@ -127,149 +479,131 @@ sub reject_connection {
     }
 }
 
-if ( $ssh_command =~ m/[\&\(\{\;\<\`\>\\]+/ ) {
+if ( $check_command_line eq "1" ) {
+    
+    if ( $ssh_command =~ m/$check_regex/ ) {
+        # reject according to $debug, and log why
+        reject_connection("Rejected command due to bad character: $ssh_command");
+    }
+}
+
+if ( not $ssh_command =~ m|$rsync_regex| ) {
     # reject according to $debug, and log why
-    reject_connection("Rejected command due to bad character: $ssh_command");
+    reject_connection("Rejected unknown command: $ssh_command");
 }
 
-if ( $ssh_command =~ m|^/usr/bin/rsync --server.*| ) {
-		# Since backups are done against snapshots, while restores,
-		# should take place directly on the filesystem, I needed a way to 
-		# determine if this is a backup or a restore.  To accomplish this
-		# I add the benign option "--timeout=0" to the rsync restore command
-		# options defined in BackupPC then simply check for this option in
-		# the command string sent from the server.  If it finds the "--timeout=0"
-		# string it simply runs the command as sent directly on the filesystem.
-		# Otherwise it creates and mounts the LVM snapshots and runs the command
-		# in the chroot environment.
 
-		if ( $ssh_command =~ m/.*--timeout=0.*/ ) {
-			# This is a restore, no chroot, just run the orginal rsync command
-			log_it("Restoring files: $ssh_command");
-		        system($ssh_command);
-		}
-		else {
-			log_it("Doing backup: $ssh_command");
-                        # This is a backup, start the snapshots, change root, then run the rsync command
-			mkdir $chroot_dir || log_exit "Failed to create $chroot_dir";
-		        # flush data (should we stop them, snapshot, and then start em?
-		        restart_services(@services);
-                        system("sync");
-                        # lvm snapshot
-		        system("lvsnap start >/dev/null 2>&1");
-			if ( $? != 0 ) {
-			    # lvsnap failed. check for all mounts, and continue if all ok
-			    log_it "lvsnap start failed. Checking...";
-			    open(TAB,"/proc/mounts") || log_exit "Cannot open /proc/mounts";
-			    my @mounts=grep(/$chroot_dir/, <TAB>);
-			    close(TAB);
-			    my $num_mounts=$#mounts + 1;
-			    if ( $num_mounts < $mounts_under_chroot ) {
-				log_exit("Not enough drives were mounted. Wanted $mounts_under_chroot but only got $num_mounts. Backup Failed");
-			    }
-			    log_it "Everything was fine";
-	                }
-		        # bring back services
-		        # start_services(@services);
-                        # trap signals
-		        $SIG{INT}  = \&close_rsync;
-		        $SIG{HUP}  = \&close_rsync;
-		        $SIG{TERM} = \&close_rsync;
-                        $SIG{ALRM} = \&close_rsync;
-                        $SIG{PIPE} = \&close_rsync;
-                        $SIG{STOP} = \&close_rsync;
-                        $SIG{TSTP} = \&close_rsync;
-                        $SIG{TTIN} = \&close_rsync;
-                        # do backup
-		        log_it "Starting backup";
-			system("chroot $chroot_dir $ENV{SSH_ORIGINAL_COMMAND}");
-		        # check, and if failed do vlsnap stop and then exit
-                        my $exit_val=$?;
-		        if ( $exit_val != 0 ) {
-			    log_it "Rsync exited with error $exit_val";
-			}
-		        else {
-			    log_it "Rsync finished successfully";
-		        }
-		        $SIG{INT} = '';
-		        $SIG{HUP} = '';
-		        $SIG{TERM} = '';
-		        system("lvsnap stop >/dev/null 2>&1");
-		        if ( $? != 0 ) { log_exit "'lvsnap stop' failed: $?"; }
-                        rmdir $chroot_dir; # safe bacause command cannot do a recursive removal
-		        log_it("Backup completed");
-                }
-		exit 0;
+######
+# Main
+######
+
+# Since backups are done against snapshots, while restores,
+# should take place directly on the filesystem, I needed a way to 
+# determine if this is a backup or a restore.  To accomplish this
+# I add the benign option "--timeout=0" to the rsync restore command
+# options defined in BackupPC then simply check for this option in
+# the command string sent from the server.  If it finds the "--timeout=0"
+# string it simply runs the command as sent directly on the filesystem.
+# Otherwise it creates and mounts the LVM snapshots and runs the command
+# in the chroot environment.
+
+if ( $ssh_command =~ m/.*--timeout=0.*/ ) {
+        # This is a restore, no chroot, just run the orginal rsync command
+	log_it("Restoring files: $ssh_command");
+	system($ssh_command);
+        exit $? >> 8;
 }
 
-# 'hack' to restore selinux context(s)
-if ( $ssh_command =~ m/^restorecontext rsync .*/ ) {
-    my $ret_val;
-    # first, is selinux active on this machine?
-    my $do_restore=1;
-    if ( not -e "/selinux/enforce" ) {
-        # yes, that's it. even in permissive mode we should do it
-	# rejecting or error may be unwise.
-	# it would tell the person if selinux was running
-	# so we will go through the motions, but not do anything
-	$do_restore=0;
-    }	
-    my @files=split( / / , $ENV{SSH_ORIGINAL_COMMAND});
-    shift @files;
-    shift @files;
-    my @restored=();
-    my @failed_restore=("FAILED to fix Selinux context of: ");
-    my @do_not_exist=("Supposably restored files that DO NOT EXIST: ");
-    foreach my $file (@files) {
-	if ( not -e $file ) {
-	    push @do_not_exist, $file;
-	    if ( $debug == 1 ) {
-		print "File does not exist: $file\n";
-	    }
-	    next;
-	}
-	if ( $do_restore == 0 ) {
-	    push @restored, $file;
-	    next;
-	}
-        # file by file, due to possible arg length limit
-	system("restorecon -RF \"$file\" >/dev/null 2>&1");
-	if ( $? == 0 ) {
-	    push @restored, $file;
-	} else {
-	    push @failed_restore, $file;
-	    if ( $debug == 1 ) {
-		# If debug is set, print info back to BackupPC
-		# This is a security vulnurablility, as an attacker
-		# can get a full file list of the system.
-		# Of course, they can with rsync, but...
-		print "Failed to fix Selinux context of $file\n";
-	    }
-	}
+# Proceed with snapshot / backup
+log_it("Doing backup: $ssh_command");
+
+# get lock by placing a read lock on ourself
+my $lock_msg=0;
+open(LOCK,"<",$0) or die "Cannot open $0 for locking: $!";
+while ( not flock(LOCK, LOCK_EX|LOCK_NB) ) {
+    if ( $lock_msg == 0 ) {
+        $lock_msg=1;
+	log_print "A backup is currently running. Waiting for it to stop";
     }
-    if ( $do_restore == 0 ) {
-	log_it "Did not fix Selinux contexts: it was not loaded";
-    }
-    if ( $#restored != $#files ) {
-	unshift @restored, "File restored: ";
-	if ( $do_restore == 1 ) {
-	    log_it "Fixing of some or all SELinux contexts failed";
-	} else {
-	    # this corresponds to the above "I did not fix..."
-	    log_it "However, here are some restored files that were not found, which should be useful";
+    # wait a bit and try again
+    sleep 300;
+}
+
+# pre run
+if ($pre_run ne "" ) {
+    log_it "Running pre-run: $pre_run";
+    system($pre_run);
+}
+
+# trap signals
+$SIG{INT}  = \&do_cleanup;
+$SIG{HUP}  = \&do_cleanup;
+$SIG{TERM} = \&do_cleanup;
+$SIG{ALRM} = \&do_cleanup;
+
+# Start the snapshots, change root, then run the rsync command
+
+# dump databases, if requested
+pg_dump();
+# mysql_dump();
+# flush and lock databases, if requested
+mysql_lock();
+pgsql_lock();
+# stop services
+services('stop',@services);
+# sync disks
+system("sync");
+# lvm snapshot
+if ( $use_chroot ) {
+    mkdir $chroot_dir || log_exit "Failed to create $chroot_dir";
+    system("$snapshot_program start >/dev/null 2>&1");
+    if ( $? >> 8 != 0 ) {
+        # lvsnap 'failed'. check for all mounts, and continue if all ok
+	log_print "$snapshot_program start, exited with non-zero code.";
+	if ($mounts_under_chroot == -1) {
+	    log_exit "Backup failed due to $snapshot_program";
 	}
-#	log_it(@restored)        if ( $#restored > 0 );
-	log_it(@failed_restore)  if ( $#failed_restore > 0 );
-	log_it(@do_not_exist)    if ( $#do_not_exist > 0 );
-	$ret_val=1;
+	log_it "Checking mounts...";
+	check_mounts();
+	log_it "Everything was fine";
     }
+    # we always check one way or the other
     else {
-	log_it "Successfully fixed Selinux contexts of requested files"; 
-	$ret_val=0;
+	check_mounts();
     }
-    exit $ret_val;
 }
-	    
+# free databases and bring back services
+services('start',@services);
+mysql_unlock();
+pgsql_unlock();
+# TODO: add thread to monitor lvm free space (or should lvsnap do this?)
 
-# otherwise, reject according to $debug, and log why
-reject_connection("Rejected unknown command: $ssh_command");
+# do backup
+my $chroot_cmd="";
+if ( $use_chroot ) {
+    $chroot_cmd="chroot $chroot_dir";
+    log_print "Starting backup with chroot command: $chroot_cmd";
+}
+else {
+    log_print "Starting backup (no chroot)";
+}
+system("$chroot_cmd $ENV{SSH_ORIGINAL_COMMAND}");
+# check, and if failed just report it (perhaps we should set the
+# script exit value to this?)
+my $exit_val=$? >> 8;
+if ( $exit_val != 0 ) {
+    log_print "Rsync exited with error $exit_val";
+}
+else {
+    log_print "Rsync finished successfully";
+}
+
+# clean lvm, child processes, dumps, and do post run
+do_cleanup();
+$SIG{INT}  = 'DEFAULT';
+$SIG{HUP}  = 'DEFAULT';
+$SIG{TERM} = 'DEFAULT';
+$SIG{ALRM} = 'DEFAULT';
+
+log_it("Backup completed");
+exit $exit_val;
