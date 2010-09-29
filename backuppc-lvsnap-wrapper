@@ -4,6 +4,9 @@
 # I'm sure it's not perfect, but it's better than allowing any command to
 # run.
 
+# Note that it should never print to STOUT. BackupPC does wierd things
+# if anything gets printed out (besides what rsync does).
+
 # version: Sept 29, 2010
 
 # look for backuppc-lvsnap-wrapper.conf in these dirs
@@ -127,19 +130,15 @@ sub log_it {
     my $message="";
     foreach (@_) { $message=$message." ".$_; }
     $message=substr($message,1);
+#   print causes errors
+#   print $message."\n";
     # no perror, as rsync talks back to server by stdout
     openlog($program, "nofatal,pid", "local0");
     syslog("info", $message);
     closelog();
 }
 
-sub log_print {
-    log_it(@_);
-    foreach (@_) {
-	print "$_\n";
-    }
-}
-
+# this one exits with a cleanup
 sub log_exit {
     log_it(@_);
     do_cleanup();
@@ -147,12 +146,20 @@ sub log_exit {
     exit 1;
 }
 
+# just log and die
+sub log_die {
+    my $msg = shift;
+    log_it($msg);
+    die $msg;
+}
+
 sub debug {
     return if ( $debug == 0 );
     log_it(@_);
-    foreach (@_) {
-	print "$_\n";
-    }
+    # print causes problems
+    # foreach (@_) {
+    #	print "$_\n";
+    # }
 }
 
 ##################
@@ -166,13 +173,12 @@ foreach (@config_dirs) {
     last if ( -f $config );
 }
 if ( not -f $config ) {
-    print "failed to find config 'backuppc-lvsnap-wrapper.conf' in dirs: @config_dirs\n";
-    exit 1;
+    log_die "failed to find config 'backuppc-lvsnap-wrapper.conf' in dirs: @config_dirs";
 }
 unless ( $config_return = do $config ) {
-    die "couldn't parse $config: $@" if $@;
-    die "couldn't do $config: $!" unless defined $config_return;
-    die "couldn't run $config" unless $config_return;
+    log_die "couldn't parse $config: $@" if $@;
+    log_die "couldn't do $config: $!" unless defined $config_return;
+    log_die "couldn't run $config" unless $config_return;
     # die "other error"; # not needed
 }
 
@@ -337,7 +343,7 @@ sub my_dump {
 	log_it "Finished dumping mysql database.";
     }
     else {
-	print "Failed to dump mysql database. Exit code $myexit.";
+	# still have to cleanup
 	log_exit "Failed to dump mysql database. Exit code $myexit.";
     }
     
@@ -392,7 +398,7 @@ sub pg_dump {
 	log_it "Finished dumping pgsql database.";
     }
     else {
-	print "Failed to dump pgsql database. Exit code $pgexit.";
+	# we still have to cleanup
 	log_exit "Failed to dump pgsql database. Exit code $pgexit.";
     }
     
@@ -430,8 +436,8 @@ if ( $ssh_command =~ m/^restorecontext rsync .*/ ) {
     
     # log that we are doing it (for large restores, user may wonder
     # why it is taking so long. I'm talking full system restores).
-    log_print("restoring selinux contexts for files");
-    print "Only errors will be shown" if ( $debug == 1 );
+    log_it "restoring selinux contexts for files";
+    debug "Only errors will be shown";
     
     # file list
     my @reset_files=split( / / , $ENV{SSH_ORIGINAL_COMMAND});
@@ -443,25 +449,26 @@ if ( $ssh_command =~ m/^restorecontext rsync .*/ ) {
     my $restore_fails=0;
     foreach my $reset_file (@reset_files) {
 	if ( not -e $reset_file ) {
-	    print "$selinux_tag File does not exist: $reset_file\n";
+	    log_it "$selinux_tag File does not exist: $reset_file";
 	    next;
 	}
         # one by one, due to possible arg length limit. no output by default
 	system("restorecon","-RF",$reset_file);
 	if ( $? >> 8 == 0 ) {
 	    $restore_success+=1;
-	    print "$selinux_tag Reset context for $reset_file\n" if ( $debug == 1 );
+	    debug "$selinux_tag Reset context for $reset_file\n" if ( $debug == 1 );
 	} else {
 	    $restore_fails+=1;
-	    print "$selinux_tag Error: Failed to fix Selinux context of $reset_file\n";
+	    log_it "$selinux_tag Error: Failed to fix Selinux context of $reset_file";
 	}
     }
     # log how it went
     if ( $restore_fails == 0 ) {
-	log_print "$selinux_tag Sucessfully reset contexts of $restore_success files/folders";
+	log_it "$selinux_tag Sucessfully reset contexts of $restore_success files/folders";
     }
     else {
-	log_print "$selinux_tag Error: Failed to reset contexts ($restore_success succeeded, $restore_fails failed)";
+	# no need for cleanup
+	log_it "$selinux_tag Error: Failed to reset contexts ($restore_success succeeded, $restore_fails failed)";
 	exit 1;
     }
     # nothing left to do
@@ -480,25 +487,29 @@ sub do_cleanup {
     
     # send HUP to all child processes [ snazzy writing of: kill('HUP', -$$) ]
     # without the IGNORE, the parent (us) gets signalled too
-    if ( kill 0 => -$$ ) {
-	log_it("killing child processes -$$");
-	$SIG{HUP} = 'IGNORE';
-        kill HUP => -$$;
-        sleep 2;
-        $SIG{TERM} = 'IGNORE';
-        kill TERM => -$$;
-	sleep 2;
-    }
+#    if ( kill 0 => -$$ ) {
+#	log_it("killing child processes -$$");
+#	$SIG{HUP} = 'IGNORE';
+ #       kill HUP => -$$;
+ #       sleep 2;
+ #       $SIG{TERM} = 'IGNORE';
+ #       kill TERM => -$$;
+#	sleep 2;
+#    }
     # stop lvm, dumps, etc
     if ( $use_chroot ) {
 	log_it("Cleaning up snapshots");
 	system("$snapshot_program stop >/dev/null 2>&1");
-        if ( $? >> 8 != 0 ) {
-	    log_it "running \'$snapshot_program stop\' failed with code: ".$? >> 8;
+        my $snap_ret=$? >> 8;
+	if ( $snap_ret != 0 ) {
+	    log_it "running \'$snapshot_program stop\' failed with code: ".$snap_ret;
             # sendmail(); 
 	    # if system keeps lvm snapshots up, it may run out ot space and crash
 	    system("echo $snapshot_program stop failed | mail -s Failure root");
         }
+	else {
+	    log_it "$snapshot_program stop success";
+	}
     	rmdir $chroot_dir; # safe bacause command cannot do a recursive removal
         
 	# post snapshot
@@ -513,6 +524,7 @@ sub do_cleanup {
     }
     
     # database dumps
+    log_it("Cleaning up dumps");
     my_dump_cleanup();
     pg_dump_cleanup();
     
@@ -529,7 +541,7 @@ sub do_cleanup {
     # to exit, or not to exit...
     if ( $sig eq "INT" or $sig eq "HUP" or $sig eq "TERM" or $sig eq "ALRM" ) {
         # do not use log_exit, as it will loop
-	log_print "Exiting due to signal $sig";
+	log_it "Exiting due to signal $sig";
 	exit 1;
     }
 }
@@ -556,6 +568,7 @@ sub reject_connection {
     my $message = shift;
     log_it $message;
     if ( $debug == 1 ) {
+	# this print is okay
 	print "Rejected\n";
         exit 1;
     }
@@ -610,7 +623,7 @@ if ( $use_chroot ) {
     while ( not flock(LOCK, LOCK_EX|LOCK_NB) ) {
         if ( $lock_msg == 0 ) {
             $lock_msg=1;
-	    log_print "A backup is currently running. Waiting for it to stop";
+	    log_it "A backup is currently running. Waiting for it to stop";
         }
         # wait a bit and try again
         sleep 300;
@@ -652,7 +665,7 @@ if ( $use_chroot ) {
     system("$snapshot_program start >/dev/null 2>&1");
     if ( $? >> 8 != 0 ) {
         # lvsnap 'failed'. check for all mounts, and continue if all ok
-	log_print "$snapshot_program start, exited with non-zero code.";
+	log_it "\'$snapshot_program start\' exited with non-zero code of ".$? >> 8;
 	if ($mounts_under_chroot == -1) {
 	    log_exit "Backup failed due to non-zero exit from $snapshot_program";
 	}
@@ -676,20 +689,20 @@ if ( $use_chroot ) {
 my $chroot_cmd="";
 if ( $use_chroot ) {
     $chroot_cmd="chroot $chroot_dir";
-    log_print "Starting backup with chroot command: $chroot_cmd";
+    log_it "Starting backup with chroot command: $chroot_cmd";
 }
 else {
-    log_print "Starting backup (no chroot)";
+    log_it "Starting backup (no chroot)";
 }
 system("$chroot_cmd $ENV{SSH_ORIGINAL_COMMAND}");
 # check, and if failed just report it (perhaps we should set the
 # script exit value to this?)
 my $exit_val=$? >> 8;
 if ( $exit_val != 0 ) {
-    log_print "Rsync exited with error $exit_val";
+    log_it "Rsync exited with error $exit_val";
 }
 else {
-    log_print "Rsync finished successfully";
+    log_it "Rsync finished successfully";
 }
 
 # clean lvm, child processes, dumps, and do post run
