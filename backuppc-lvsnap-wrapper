@@ -10,19 +10,21 @@
 # use the first one found
 my @config_dirs = qw(/usr/local/etc /etc);
 
-# Defaults (Do NOT change these here. Change them in the 
-# /etc/backuppc-lvsnap-wrapper.conf file).
+# Defaults (Do NOT change these here. Change them
+# in backuppc-lvsnap-wrapper.conf
 
 # Comments are mainly for developer.
 
 # Chroot
-my $chroot_dir="/mnt/snapback";
+my $chroot_dir="";
 my $snapshot_program="lvsnap";
 my $mounts_under_chroot=-1;
 
 # Services
 my $stop_services='';
 my $init="/etc/init.d";
+my $pre_snapshot="";
+my $post_snapshot="";
 
 # MySQL
 my $mysql_user='';
@@ -277,6 +279,61 @@ sub pgsql_unlock {
     }
 }
 
+#####################
+# Database dumps
+
+# TODO: combine pg_dump and my_dump
+
+sub my_dump {
+    return if ($mysql_user eq "" or $mysql_dump eq 0 );
+    
+    # set UNLINK just in case dump goes crazy
+    my ($fh, $passfile) = tempfile( "mysqldump.backuppc.XXXXXXXXXXXXXXX", TMPDIR => 1, UNLINK => 1 );
+    
+    # defaults file
+    print $fh "[client]\n";
+    print $fh "password=\"$mysql_pass\"\n";
+    # just to make sure...
+    chmod 0600, $passfile;
+    close($fh);
+    # create a secure file for dump
+    open(BAC,">",$mysql_dump_file)  || die "cannot open or create $mysql_dump_file: $!";
+    close(BAC);
+    system("chown","root:root",$mysql_dump_file);
+    chmod 0600, $mysql_dump_file;
+    # dump
+    log_it "Dumping mysql database to $mysql_dump_file";
+    my $myexit;
+    # left out --opt, as it may cause probems, and it's the default anyways
+    if ( $mysql_compress eq "" ) {
+	$myexit=`mysqldump -u \"$mysql_user\" --defaults-extra-file=\"$passfile\" --all-databases > \"$mysql_dump_file\" ; echo $?`;
+    }
+    else {
+	# ugly, but allows us to check exit codes of both piped commands, rather than just the last
+	$myexit=`mysqldump -u \"$mysql_user\" --defaults-extra-file=\"$passfile\" --all-databases | $mysql_compress > \"$mysql_dump_file\" ; expr \$(echo \${PIPESTATUS[\@]} | sed 's/ / + /g')`;
+    }
+    # did it work?
+    chomp $myexit;
+    if ( $myexit eq 0 ) {
+	log_it "Finished dumping mysql database.";
+    }
+    else {
+	print "Failed to dump mysql database. Exit code $myexit.";
+	log_exit "Failed to dump mysql database. Exit code $myexit.";
+    }
+    
+    # we dont need defaults file anymore (we really dont have to do this, but just to be safe)
+    close($fh);
+    unlink($passfile);
+}
+
+sub my_dump_cleanup {
+    return if ($mysql_user eq "" or $mysql_dump eq 0 );
+    
+    unlink $mysql_dump_file;
+
+}
+    
 
 # dump database of pgsql to file
 sub pg_dump {
@@ -285,11 +342,9 @@ sub pg_dump {
     # set UNLINK just in case pg_dumpall goes crazy
     my ($fh, $passfile) = tempfile( "pgpass.backuppc.XXXXXXXXXXXXXXX", TMPDIR => 1, UNLINK => 1 );
     
-    # my $passfile=$ENV{HOME}."/.pgpass-backuppc";
-    # open(my $fh,">",$passfile);
-    
     # pgpass file, instead of .pgpass: format is '*:*:*:user:password'
     print $fh "*:*:*:$pgsql_user:$pgsql_pass";
+    # just to make sure...
     chmod 0600, $passfile;
     close($fh);
     # create a secure file for dump
@@ -308,12 +363,11 @@ sub pg_dump {
 	$pgexit=`pg_dumpall -U \"$pgsql_user\" -w > \"$pgsql_dump_file\" ; echo $?`;
     }
     else {
-	# ugly, but allows us to check both piped commands, rather than just the last
+	# ugly, but allows us to check exit codes of both piped commands, rather than just the last
         $pgexit=`pg_dumpall -U \"$pgsql_user\" -w | $pgsql_compress > \"$pgsql_dump_file\" ; expr \$(echo \${PIPESTATUS[\@]} | sed 's/ / + /g')`;
-	# $pgexit=`echo okay | $pgsql_compress > \"$pgsql_dump_file\" ; expr \$(echo \${PIPESTATUS[\@]} | sed 's/ / + /g')`;
     }
     # did it work?
-    # $pgexit=$? >> 8 if( $? >> 8 != 0 );
+    # $pgexit=$? >> 8 if( $? >> 8 != 0 ); (no good)
     chomp $pgexit;
     if ( $pgexit eq 0 ) {
 	log_it "Finished dumping pgsql database.";
@@ -335,58 +389,6 @@ sub pg_dump_cleanup {
 
 }
 
-##############
-# cleanup
-
-sub do_cleanup {
-    
-    my $sig=shift;
-    
-    log_it "Cleaning up";
-    
-    # send HUP to all child processes [ snazzy writing of: kill('HUP', -$$) ]
-    # without the IGNORE, the parent (us) gets signalled too
-    if ( kill 0 => -$$ ) {
-	log_it("killing child processes -$$");
-	local $SIG{HUP} = 'IGNORE';
-        kill HUP => -$$;
-        sleep 2;
-        local $SIG{TERM} = 'IGNORE';
-        kill TERM => -$$;
-    }
-    # stop lvm, dumps, etc
-    if ( $use_chroot ) {
-	system("$snapshot_program stop >/dev/null 2>&1");
-        if ( $? >> 8 != 0 ) {
-	    log_it "running \'$snapshot_program stop\' failed with code: ".$? >> 8;
-            # sendmail(); 
-	    system("echo $snapshot_program stop failed | mail -s Failure root");
-        }
-    	rmdir $chroot_dir; # safe bacause command cannot do a recursive removal
-    }
-    # services
-    services('start',@services);
-    # databases
-    mysql_unlock();
-    pgsql_unlock();
-    pg_dump_cleanup();
-    
-    # post run
-    if ($post_run ne "" ) {
-        log_it "Running post-run: $post_run";
-        system($post_run);
-    }
-    
-    # remove lock
-    # we could do it here, but may a well just close program and be done with it
-    
-    # to exit, or not to exit...
-    if ( $sig eq "INT" or $sig eq "HUP" or $sig eq "TERM" or $sig eq "ALRM" ) {
-        # do not use log_exit, as it will loop
-	log_print "Exiting due to signal $sig";
-	exit 1;
-    }
-}
 
 #################
 # selinux reset contexts (for file restore)
@@ -447,6 +449,72 @@ if ( $ssh_command =~ m/^restorecontext rsync .*/ ) {
     }
     # nothing left to do
     exit 0;
+}
+
+
+##############
+# cleanup
+
+sub do_cleanup {
+    
+    my $sig=shift;
+    
+    log_it "Cleaning up";
+    
+    # send HUP to all child processes [ snazzy writing of: kill('HUP', -$$) ]
+    # without the IGNORE, the parent (us) gets signalled too
+    if ( kill 0 => -$$ ) {
+	log_it("killing child processes -$$");
+	$SIG{HUP} = 'IGNORE';
+        kill HUP => -$$;
+        sleep 2;
+        $SIG{TERM} = 'IGNORE';
+        kill TERM => -$$;
+	sleep 2;
+    }
+    # stop lvm, dumps, etc
+    if ( $use_chroot ) {
+	log_it("Cleaning up snapshots");
+	system("$snapshot_program stop >/dev/null 2>&1");
+        if ( $? >> 8 != 0 ) {
+	    log_it "running \'$snapshot_program stop\' failed with code: ".$? >> 8;
+            # sendmail(); 
+	    # if system keeps lvm snapshots up, it may run out ot space and crash
+	    system("echo $snapshot_program stop failed | mail -s Failure root");
+        }
+    	rmdir $chroot_dir; # safe bacause command cannot do a recursive removal
+        
+	# post snapshot
+	system("$post_snapshot") if ( $post_snapshot ne "" );
+	
+        # services
+        services('start',@services);
+    
+        # database locks
+        mysql_unlock();
+        pgsql_unlock();
+    }
+    
+    # database dumps
+    my_dump_cleanup();
+    pg_dump_cleanup();
+    
+    # post run
+    if ($post_run ne "" ) {
+        log_it "Running post-run: $post_run";
+        system($post_run);
+    }
+    
+    # remove lock
+    # we could do it here, but may a well just close program and be done with it
+    # (we are locking the the source code - ourself)
+    
+    # to exit, or not to exit...
+    if ( $sig eq "INT" or $sig eq "HUP" or $sig eq "TERM" or $sig eq "ALRM" ) {
+        # do not use log_exit, as it will loop
+	log_print "Exiting due to signal $sig";
+	exit 1;
+    }
 }
 
 
@@ -518,15 +586,18 @@ if ( $ssh_command =~ m/.*--timeout=0.*/ ) {
 log_it("Doing backup: $ssh_command");
 
 # get lock by placing a read lock on ourself
-my $lock_msg=0;
-open(LOCK,"<",$0) or die "Cannot open $0 for locking: $!";
-while ( not flock(LOCK, LOCK_EX|LOCK_NB) ) {
-    if ( $lock_msg == 0 ) {
-        $lock_msg=1;
-	log_print "A backup is currently running. Waiting for it to stop";
+# we only need this if we are doing chroots, as normal usage should be fine
+if ( $use_chroot ) {
+    my $lock_msg=0;
+    open(LOCK,"<",$0) or die "Cannot open $0 for locking: $!";
+    while ( not flock(LOCK, LOCK_EX|LOCK_NB) ) {
+        if ( $lock_msg == 0 ) {
+            $lock_msg=1;
+	    log_print "A backup is currently running. Waiting for it to stop";
+        }
+        # wait a bit and try again
+        sleep 300;
     }
-    # wait a bit and try again
-    sleep 300;
 }
 
 # pre run
@@ -545,23 +616,28 @@ $SIG{ALRM} = \&do_cleanup;
 
 # dump databases, if requested
 pg_dump();
-# mysql_dump();
-# flush and lock databases, if requested
-mysql_lock();
-pgsql_lock();
-# stop services
-services('stop',@services);
-# sync disks
-system("sync");
-# lvm snapshot
+mysql_dump();
+
+# now we take the snapshots
 if ( $use_chroot ) {
+    # flush and lock databases, if requested
+    mysql_lock();
+    pgsql_lock();
+    # stop services
+    services('stop',@services);
+    # pre-snapshot
+    system("$pre_snapshot") if ( $pre_snapshot ne "" );
+    # sync disks
+    system("sync");
+    # lvm snapshot
+    log_it("Creating snapshots");
     mkdir $chroot_dir || log_exit "Failed to create $chroot_dir";
     system("$snapshot_program start >/dev/null 2>&1");
     if ( $? >> 8 != 0 ) {
         # lvsnap 'failed'. check for all mounts, and continue if all ok
 	log_print "$snapshot_program start, exited with non-zero code.";
 	if ($mounts_under_chroot == -1) {
-	    log_exit "Backup failed due to $snapshot_program";
+	    log_exit "Backup failed due to non-zero exit from $snapshot_program";
 	}
 	log_it "Checking mounts...";
 	check_mounts();
@@ -571,12 +647,13 @@ if ( $use_chroot ) {
     else {
 	check_mounts();
     }
+    # free databases and bring back services
+    system("$post_snapshot") if ( $post_snapshot ne "" );
+    services('start',@services);
+    mysql_unlock();
+    pgsql_unlock();
+    # TODO: add thread to monitor lvm free space (or should lvsnap do this?)
 }
-# free databases and bring back services
-services('start',@services);
-mysql_unlock();
-pgsql_unlock();
-# TODO: add thread to monitor lvm free space (or should lvsnap do this?)
 
 # do backup
 my $chroot_cmd="";
