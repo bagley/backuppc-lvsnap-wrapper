@@ -355,7 +355,13 @@ sub my_dump {
 sub my_dump_cleanup {
     return if ($mysql_user eq "" or $mysql_dump eq 0 );
     
-    unlink $mysql_dump_file;
+    if ( -f $mysql_dump_file ) {
+	log_it("Removing mysql dump file");
+        unlink $mysql_dump_file;
+    }
+    else {
+	log_it("Error: No mysql dump file at $mysql_dump_file");
+    }
 
 }
     
@@ -410,8 +416,13 @@ sub pg_dump {
 sub pg_dump_cleanup {
     return if ($pgsql_user eq "" or $pgsql_dump eq 0 );
     
-    unlink $pgsql_dump_file;
-
+    if ( -f $pgsql_dump_file ) {
+	log_it("Removing postgres dump file");
+        unlink $pgsql_dump_file;
+    }
+    else {
+	log_it("Error: No postgres dump file at $pgsql_dump_file");
+    }
 }
 
 
@@ -487,15 +498,15 @@ sub do_cleanup {
     
     # send HUP to all child processes [ snazzy writing of: kill('HUP', -$$) ]
     # without the IGNORE, the parent (us) gets signalled too
-#    if ( kill 0 => -$$ ) {
-#	log_it("killing child processes -$$");
-#	$SIG{HUP} = 'IGNORE';
- #       kill HUP => -$$;
- #       sleep 2;
- #       $SIG{TERM} = 'IGNORE';
- #       kill TERM => -$$;
-#	sleep 2;
-#    }
+    if ( kill 0 => -$$ ) {
+	log_it("killing child processes -$$");
+	$SIG{HUP} = 'IGNORE';
+        kill HUP => -$$;
+        sleep 2;
+        $SIG{TERM} = 'IGNORE';
+        kill TERM => -$$;
+	sleep 2;
+    }
     # stop lvm, dumps, etc
     if ( $use_chroot ) {
 	log_it("Cleaning up snapshots");
@@ -508,12 +519,15 @@ sub do_cleanup {
 	    system("echo $snapshot_program stop failed | mail -s Failure root");
         }
 	else {
-	    log_it "$snapshot_program stop success";
+	    log_it "$snapshot_program stop successful";
 	}
     	rmdir $chroot_dir; # safe bacause command cannot do a recursive removal
         
 	# post snapshot
-	system("$post_snapshot") if ( $post_snapshot ne "" );
+	if ( $post_snapshot ne "" ) {
+	    log_it "Running $post_snapshot";
+	    system("$post_snapshot") ;
+	}
 	
         # services
         services('start',@services);
@@ -524,7 +538,6 @@ sub do_cleanup {
     }
     
     # database dumps
-    log_it("Cleaning up dumps");
     my_dump_cleanup();
     pg_dump_cleanup();
     
