@@ -4,7 +4,7 @@
 # I'm sure it's not perfect, but it's better than allowing any command to
 # run.
 
-# version: Sept 28, 2010
+# version: Sept 29, 2010
 
 # look for backuppc-lvsnap-wrapper.conf in these dirs
 # use the first one found
@@ -13,64 +13,64 @@ my @config_dirs = qw(/usr/local/etc /etc);
 # Defaults (Do NOT change these here. Change them
 # in backuppc-lvsnap-wrapper.conf
 
-# Comments are mainly for developer.
+# Comments are mainly for developer. Use 'our' or config will not load.
 
 # Chroot
-my $chroot_dir="";
-my $snapshot_program="lvsnap";
-my $mounts_under_chroot=-1;
+our $chroot_dir="";
+our $snapshot_program="lvsnap";
+our $mounts_under_chroot=-1;
 
 # Services
-my $stop_services='';
-my $init="/etc/init.d";
-my $pre_snapshot="";
-my $post_snapshot="";
+our $stop_services='';
+our $init="/etc/init.d";
+our $pre_snapshot="";
+our $post_snapshot="";
 
 # MySQL
-my $mysql_user='';
-my $mysql_pass='';
+our $mysql_user='';
+our $mysql_pass='';
 # dump (1), lock(0)
-my $mysql_dump=1;
+our $mysql_dump=1;
 # compress with what? '' to disable.
-my $mysql_compress='';
+our $mysql_compress='';
 # where to save it.
-my $mysql_dump_file='';
+our $mysql_dump_file='';
 
 # PgSQL
-my $pgsql_user='';
-my $pgsql_pass='';
+our $pgsql_user='';
+our $pgsql_pass='';
 # dump (1), lock(0)
-my $pgsql_dump=1;
+our $pgsql_dump=1;
 # compress with what? '' to disable.
-my $pgsql_compress='';
+our $pgsql_compress='';
 # where to save it.
-my $pgsql_dump_file='';
+our $pgsql_dump_file='';
 
 # External
 # before all
-my $pre_run = "";
+our $pre_run = "";
 # after all
-my $post_run = "";
+our $post_run = "";
 
 # Checks
 #  rsync command must pass this, or reject
-my $rsync_regex='^/usr/bin/rsync --server.*';
+our $rsync_regex='^/usr/bin/rsync --server.*';
 #  check for shell escapes
-my $check_command_line=1;
+our $check_command_line=1;
 # check regex
-my $check_regex = '[\\\[\]\&\(\{\}\;\<\>`]+';
+our $check_regex = '[\\\[\]\&\(\{\}\;\<\>`]+';
 
-# Debug (0=no message, 1='rejected')
-my $debug=0;
+# Debug (0=off, 1=on)
+our $debug=0;
 
 # app vars
-my $program="BackupPC-wrapper";
+our $program="BackupPC-wrapper";
 $ENV{PATH}="/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/usr/local/sbin";
 
 # To test, this is one method you can use (on the same machine as the script)
 # First, in a shell, set the SSH_ORIGINAL_COMMAND to the command you want to test
 # Keep in mind this command will be run like normal, so be careful
-#    export SSH_ORIGINAL_COMMAND="restorecontext rsync /etc/mtab"
+#    export SSH_ORIGINAL_COMMAND="/usr/bin/rsync --server --badarg"
 # Then run this script with no arguments. Remember
 #    /usr/local/bin/backuppc-lvsnap-wrapper
 # You will see exactly what ssh will see, and be able to view logs of actions
@@ -94,14 +94,14 @@ $ENV{PATH}="/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/usr/local/sbin";
 # add a password phrase that would be verified on access, ie
 # $accesscode="kfo84md023mf0vkdckgie";
 # only allow alphanumeric characters
-# BIG CON!: if someone gets the 
 # warn user that this is just *another* layer, and should not be relied on
 # this may require an access locking mechinism, so someone could not 
 # try to do an mem overflow on the program (option to disable lock)
 # thus, it would be: access > lock > verify code > unlock
 # lock on itself, or on config file
 
-use strict;
+
+##############################################################################
 
 # It is nice to be able to log all attempts to access the machine. However,
 # passing args directly to a command line program like 'logger' may destroy
@@ -112,42 +112,13 @@ use strict;
 # So, we use this perl module since it only gives the data to syslog.
 # It will never execute it.
 
+use strict;
+
 use Sys::Syslog;
 
 use File::Temp qw/ tempfile /;
 
 use Fcntl qw(:flock);
-
-# load config
-my $config_return;
-my $config = "";
-foreach (@config_dirs) {
-    $config = $_."/backuppc-lvsnap-wrapper.conf";
-    last if ( -f $config );
-}
-die "could not find config: $config" if ( not -f $config );
-
-if ( not $config_return = do $config ) {
-    die "couldn't parse $config: $@" if $@;
-    die "couldn't do $config: $!" unless defined $config_return;
-    # warn "couldn't run $config" unless $return;
-}
-
-# Get ssh command
-my $ssh_command=$ENV{SSH_ORIGINAL_COMMAND};
-
-# format services
-my @services=split(/,/ , $stop_services);
-
-# chroot or not
-my $use_chroot=0;
-if ( length($chroot_dir) > 0 and $chroot_dir =~ m|^/.*| ) {
-    $use_chroot=1;
-#    log_print "Using a chroot";
-# }
-# else {
-#    log_print "Not using a chroot";
-}
 
 ###########
 # logging
@@ -172,7 +143,55 @@ sub log_print {
 sub log_exit {
     log_it(@_);
     do_cleanup();
+    log_it "Fatal error";
     exit 1;
+}
+
+sub debug {
+    return if ( $debug == 0 );
+    log_it(@_);
+    foreach (@_) {
+	print "$_\n";
+    }
+}
+
+##################
+# checks and setup
+
+# load config
+my $config_return;
+my $config = "";
+foreach (@config_dirs) {
+    $config = $_."/backuppc-lvsnap-wrapper.conf";
+    last if ( -f $config );
+}
+if ( not -f $config ) {
+    print "failed to find config 'backuppc-lvsnap-wrapper.conf' in dirs: @config_dirs\n";
+    exit 1;
+}
+unless ( $config_return = do $config ) {
+    die "couldn't parse $config: $@" if $@;
+    die "couldn't do $config: $!" unless defined $config_return;
+    die "couldn't run $config" unless $config_return;
+    # die "other error"; # not needed
+}
+
+debug "Loaded config $config";
+
+# Get ssh command
+our $ssh_command=$ENV{SSH_ORIGINAL_COMMAND};
+
+# format services
+our @services=split(/,/ , $stop_services);
+
+# chroot or not
+our $use_chroot=0;
+if ( length($chroot_dir) > 0 and $chroot_dir =~ m|^/.*| ) {
+    $use_chroot=1;
+    debug "Using a chroot ($chroot_dir)";
+}
+else {
+    debug "Not using a chroot ($chroot_dir)";
 }
 
 ##########
@@ -297,7 +316,7 @@ sub my_dump {
     chmod 0600, $passfile;
     close($fh);
     # create a secure file for dump
-    open(BAC,">",$mysql_dump_file)  || die "cannot open or create $mysql_dump_file: $!";
+    open(BAC,">",$mysql_dump_file)  || log_exit "cannot open or create file $mysql_dump_file: $!";
     close(BAC);
     system("chown","root:root",$mysql_dump_file);
     chmod 0600, $mysql_dump_file;
@@ -306,11 +325,11 @@ sub my_dump {
     my $myexit;
     # left out --opt, as it may cause probems, and it's the default anyways
     if ( $mysql_compress eq "" ) {
-	$myexit=`mysqldump -u \"$mysql_user\" --defaults-extra-file=\"$passfile\" --all-databases > \"$mysql_dump_file\" ; echo $?`;
+	$myexit=`mysqldump --defaults-extra-file=\"$passfile\" -u \"$mysql_user\" --all-databases > \"$mysql_dump_file\" ; echo $?`;
     }
     else {
 	# ugly, but allows us to check exit codes of both piped commands, rather than just the last
-	$myexit=`mysqldump -u \"$mysql_user\" --defaults-extra-file=\"$passfile\" --all-databases | $mysql_compress > \"$mysql_dump_file\" ; expr \$(echo \${PIPESTATUS[\@]} | sed 's/ / + /g')`;
+	$myexit=`mysqldump --defaults-extra-file=\"$passfile\" -u \"$mysql_user\" --all-databases | $mysql_compress > \"$mysql_dump_file\" ; expr \$(echo \${PIPESTATUS[\@]} | sed 's/ / + /g')`;
     }
     # did it work?
     chomp $myexit;
@@ -348,7 +367,7 @@ sub pg_dump {
     chmod 0600, $passfile;
     close($fh);
     # create a secure file for dump
-    open(BAC,">",$pgsql_dump_file)  || die "cannot open or create $pgsql_dump_file: $!";
+    open(BAC,">",$pgsql_dump_file)  || log_exit "cannot open or create file $pgsql_dump_file: $!";
     close(BAC);
     # TODO: pg_dumpall (and dump_file) should be run as postgres, but this is system specific
     # [would have to figure out pgsql's user]
@@ -402,9 +421,7 @@ if ( $ssh_command =~ m/^restorecontext rsync .*/ ) {
     
     # first, is selinux active on this machine?
     if ( not -e "/selinux/enforce" ) {
-	if ( $debug == 1 ) {
-	    print "$selinux_tag selinux was not loaded. nothing to restore\n";
-	}
+        debug "$selinux_tag selinux was not loaded. nothing to restore";
 	exit 0;
     }
     # Yes, that's it. Even in permissive mode we should do it, since
@@ -414,7 +431,7 @@ if ( $ssh_command =~ m/^restorecontext rsync .*/ ) {
     # log that we are doing it (for large restores, user may wonder
     # why it is taking so long. I'm talking full system restores).
     log_print("restoring selinux contexts for files");
-    print "Only errors will be shown\n" if ( $debug == 0 );
+    print "Only errors will be shown" if ( $debug == 1 );
     
     # file list
     my @reset_files=split( / / , $ENV{SSH_ORIGINAL_COMMAND});
@@ -616,7 +633,7 @@ $SIG{ALRM} = \&do_cleanup;
 
 # dump databases, if requested
 pg_dump();
-mysql_dump();
+my_dump();
 
 # now we take the snapshots
 if ( $use_chroot ) {
@@ -682,5 +699,5 @@ $SIG{HUP}  = 'DEFAULT';
 $SIG{TERM} = 'DEFAULT';
 $SIG{ALRM} = 'DEFAULT';
 
-log_it("Backup completed");
+log_it("Exiting");
 exit $exit_val;
