@@ -7,16 +7,30 @@
 # Note that it should never print to STOUT. BackupPC does wierd things
 # if anything gets printed out (besides what rsync does).
 
-# version: Sept 29, 2010
+# version: Sept 29, 2010 (minor changes May 2011)
 
-# look for backuppc-lvsnap-wrapper.conf in these dirs
-# use the first one found
+
+
+#########################################
+#########################################
+#                                       #
+#       DO NOT CHANGE VARS HERE         #
+#                                       #
+#      CHANGE IN THE CONFIG FILE        #
+#                                       #
+#     backuppc-lvsnap-wrapper.conf      #
+#                                       #
+#########################################
+#########################################
+
+# Look for backuppc-lvsnap-wrapper.conf 
+# in these dirs. Use the first one found
 my @config_dirs = qw(/usr/local/etc /etc);
 
-# Defaults (Do NOT change these here. Change them
-# in backuppc-lvsnap-wrapper.conf
 
-# Comments are mainly for developer. Use 'our' or config will not load.
+
+# Comments here are mainly for developer.
+# Use 'our' or config will not load.
 
 # Chroot
 our $chroot_dir="";
@@ -68,7 +82,8 @@ our $debug=0;
 
 # app vars
 our $program="BackupPC-wrapper";
-$ENV{PATH}="/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/usr/local/sbin";
+$ENV{PATH}="/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin";
+my $run_exit=0;
 
 # To test, this is one method you can use (on the same machine as the script)
 # First, in a shell, set the SSH_ORIGINAL_COMMAND to the command you want to test
@@ -545,6 +560,7 @@ sub do_cleanup {
     if ($post_run ne "" ) {
         log_it "Running post-run: $post_run";
         system($post_run);
+	$run_exit += $? >> 8;
     }
     
     # remove lock
@@ -647,6 +663,7 @@ if ( $use_chroot ) {
 if ($pre_run ne "" ) {
     log_it "Running pre-run: $pre_run";
     system($pre_run);
+    $run_exit += $? >> 8;
 }
 
 # trap signals
@@ -726,4 +743,4 @@ $SIG{TERM} = 'DEFAULT';
 $SIG{ALRM} = 'DEFAULT';
 
 log_it("Exiting");
-exit $exit_val;
+exit $exit_val + $run_exit;
