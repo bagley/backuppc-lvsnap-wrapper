@@ -37,6 +37,9 @@ our $chroot_dir="";
 our $snapshot_program="lvsnap";
 our $mounts_under_chroot=-1;
 
+# Backup Priority (nice)
+our $nice=0;
+
 # Services
 our $stop_services='';
 our $init="/etc/init.d";
@@ -214,6 +217,23 @@ if ( length($chroot_dir) > 0 and $chroot_dir =~ m|^/.*| ) {
 else {
     debug "Not using a chroot ($chroot_dir)";
 }
+
+
+##########
+# Backup Priority (nice)
+
+# TODO: should check if this is a number
+if ( $nice > 0 ) {
+  # check that renice is installed
+  system("renice -v >/dev/null 2>&1");
+  if (  $? >> 8 == 0 ) {
+    system("renice $nice $$");
+  }
+  else {
+    log_it "Failed to run renice."
+  }
+}
+
 
 ##########
 # services
