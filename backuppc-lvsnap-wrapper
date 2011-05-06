@@ -264,7 +264,8 @@ sub db_connect {
 	return 0;
     }
     # so those without this module will be okay to still do backups
-    use DBI;
+    # TODO: needs to be tested, but no database on hand right now.
+    use autouse 'DBI';
     my $dbh = DBI->connect_cached($db, $user, $pass);
     if ( $dbh->err ) {
        log_it "Failed to connect to $db: ".$dbh->errstr;
