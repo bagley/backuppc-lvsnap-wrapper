@@ -86,7 +86,6 @@ our $debug=0;
 # app vars
 our $program="BackupPC-wrapper";
 $ENV{PATH}="/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin";
-my $run_exit=0;
 
 # To test, this is one method you can use (on the same machine as the script)
 # First, in a shell, set the SSH_ORIGINAL_COMMAND to the command you want to test
@@ -227,7 +226,7 @@ if ( $nice > 0 ) {
   # check that renice is installed
   system("renice -v >/dev/null 2>&1");
   if (  $? >> 8 == 0 ) {
-    system("renice $nice $$");
+    system("renice $nice $$ >/dev/null 2>&1");
   }
   else {
     log_it "Failed to run renice."
@@ -580,8 +579,13 @@ sub do_cleanup {
     # post run
     if ($post_run ne "" ) {
         log_it "Running post-run: $post_run";
-        system($post_run);
-	$run_exit += $? >> 8;
+        system($post_run . " >/dev/null 2>&1");
+	my $post_run_exit=$? >> 8;
+        if ( $post_run_exit != 0 ) {
+	    print STDERR "ERROR: post-run exited with error value $post_run_exit";
+	    log_it "ERROR: post-run exited with error value $post_run_exit";
+	    exit 1; # dont quite know if this is right...
+        }
     }
     
     # remove lock
@@ -675,7 +679,7 @@ if ( $use_chroot ) {
             $lock_msg=1;
 	    log_it "A backup is currently running. Waiting for it to stop";
         }
-        # wait a bit and try again
+        # wait a bit and try again. log only logs first message.
         sleep 300;
     }
 }
@@ -683,8 +687,15 @@ if ( $use_chroot ) {
 # pre run
 if ($pre_run ne "" ) {
     log_it "Running pre-run: $pre_run";
-    system($pre_run);
-    $run_exit += $? >> 8;
+    system($pre_run . " >/dev/null 2>&1");
+    my $pre_run_exit=$? >> 8;
+    if ( $pre_run_exit != 0 ) {
+	print STDERR "ERROR: pre-run exited with error value $pre_run_exit";
+	#         ^-- makes BackupPC think rsync is okay, and it sends the info to start backup.
+	# But this is better than having it just exit with no reason...
+	log_it "ERROR: pre-run exited with error value $pre_run_exit";
+	exit 1;
+    }
 }
 
 # trap signals
@@ -764,4 +775,4 @@ $SIG{TERM} = 'DEFAULT';
 $SIG{ALRM} = 'DEFAULT';
 
 log_it("Exiting");
-exit $exit_val + $run_exit;
+exit $exit_val;
