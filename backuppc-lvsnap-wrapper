@@ -38,7 +38,7 @@ our $snapshot_program="lvsnap";
 our $mounts_under_chroot=-1;
 
 # Backup Priority (nice)
-our $nice=0;
+our $nice=3;
 
 # Services
 our $stop_services='';
@@ -667,7 +667,7 @@ if ( $ssh_command =~ m/.*--timeout=0.*/ ) {
 }
 
 # Proceed with snapshot / backup
-log_it("Doing backup: $ssh_command");
+log_it("Recieved backup request: $ssh_command");
 
 # get lock by placing a read lock on ourself
 # we only need this if we are doing chroots, as normal usage should be fine
