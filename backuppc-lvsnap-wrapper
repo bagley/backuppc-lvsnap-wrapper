@@ -66,6 +66,9 @@ our $pgsql_compress='';
 # where to save it.
 our $pgsql_dump_file='';
 
+# optional database
+our $db_backup_only_if_ssh_matches='';
+
 # External
 # before all
 our $pre_run = "";
@@ -78,7 +81,7 @@ our $rsync_regex='^/usr/bin/rsync --server.*';
 #  check for shell escapes
 our $check_command_line=1;
 # check regex
-our $check_regex = '[\\\[\]\&\(\{\}\;\<\>`]+';
+our $check_regex = '[\[\]\&\(\{\}\;\<\>`]+';
 
 # Debug (0=off, 1=on)
 our $debug=0;
@@ -352,11 +355,13 @@ sub my_dump {
     
     # defaults file
     print $fh "[client]\n";
+    print $fh "user=\"$mysql_user\"\n";
     print $fh "password=\"$mysql_pass\"\n";
     # just to make sure...
     chmod 0600, $passfile;
     close($fh);
     # create a secure file for dump
+    unlink($mysql_dump_file) if ( -f $mysql_dump_file );
     open(BAC,">",$mysql_dump_file)  || log_exit "cannot open or create file $mysql_dump_file: $!";
     close(BAC);
     system("chown","root:root",$mysql_dump_file);
@@ -366,11 +371,13 @@ sub my_dump {
     my $myexit;
     # left out --opt, as it may cause probems, and it's the default anyways
     if ( $mysql_compress eq "" ) {
-	$myexit=`mysqldump --defaults-extra-file=\"$passfile\" -u \"$mysql_user\" --all-databases > \"$mysql_dump_file\" ; echo $?`;
+	print "dump db\n";
+	$myexit=`mysqldump --defaults-extra-file=\"$passfile\" --all-databases --add-drop-database --add-drop-table --add-drop-trigger --single-transaction > \"$mysql_dump_file\" ; echo $?`;
+	print "finish db\n";
     }
     else {
 	# ugly, but allows us to check exit codes of both piped commands, rather than just the last
-	$myexit=`mysqldump --defaults-extra-file=\"$passfile\" -u \"$mysql_user\" --all-databases | $mysql_compress > \"$mysql_dump_file\" ; expr \$(echo \${PIPESTATUS[\@]} | sed 's/ / + /g')`;
+	$myexit=`mysqldump --defaults-extra-file=\"$passfile\" --all-databases | $mysql_compress > \"$mysql_dump_file\" ; expr \$(echo \${PIPESTATUS[\@]} | sed 's/ / + /g')`;
     }
     # did it work?
     chomp $myexit;
@@ -381,9 +388,10 @@ sub my_dump {
 	# still have to cleanup
 	log_exit "Failed to dump mysql database. Exit code $myexit.";
     }
+    system("sync");
     
     # we dont need defaults file anymore (we really dont have to do this, but just to be safe)
-    close($fh);
+    # close($fh);
     unlink($passfile);
 }
 
@@ -573,8 +581,10 @@ sub do_cleanup {
     }
     
     # database dumps
-    my_dump_cleanup();
-    pg_dump_cleanup();
+    if ( $db_backup_only_if_ssh_matches eq "" or $ssh_command =~ m/$db_backup_only_if_ssh_matches/ ) {
+       my_dump_cleanup();
+       pg_dump_cleanup();
+    }
     
     # post run
     if ($post_run ne "" ) {
@@ -680,7 +690,7 @@ if ( $use_chroot ) {
 	    log_it "A backup is currently running. Waiting for it to stop";
         }
         # wait a bit and try again. log only logs first message.
-        sleep 300;
+        sleep 120;
     }
 }
 
@@ -706,9 +716,22 @@ $SIG{ALRM} = \&do_cleanup;
 
 # Start the snapshots, change root, then run the rsync command
 
+
 # dump databases, if requested
-pg_dump();
-my_dump();
+if ( $db_backup_only_if_ssh_matches eq "" ) {
+    debug "\$db_backup_only_if_ssh_matches is empty. Seeing if database backup is requested.";
+    pg_dump();
+    my_dump();    
+}
+elsif ( $ssh_command =~ m/$db_backup_only_if_ssh_matches/ ) {
+    debug "\$db_backup_only_if_ssh_matches matched. Backuping up databases if requested.";
+    pg_dump();
+    my_dump();
+}
+else {
+    debug "\$db_backup_only_if_ssh_matches did not match $db_backup_only_if_ssh_matches, skipping backup of database";
+}
+
 
 # now we take the snapshots
 if ( $use_chroot ) {
