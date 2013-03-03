@@ -371,22 +371,26 @@ sub my_dump {
     my $myexit;
     # left out --opt, as it may cause probems, and it's the default anyways
     if ( $mysql_compress eq "" ) {
-	print "dump db\n";
-	$myexit=`mysqldump --defaults-extra-file=\"$passfile\" --all-databases --add-drop-database --add-drop-table --add-drop-trigger --single-transaction > \"$mysql_dump_file\" ; echo $?`;
-	print "finish db\n";
+	# print "dump db mysqldump --defaults-extra-file=$passfile --all-databases --add-drop-database --add-drop-table --add-drop-trigger --single-transaction to $mysql_dump_file \n";
+	# $myexit=`mysqldump --defaults-extra-file=\"$passfile\" --all-databases --add-drop-database --add-drop-table --single-transaction > \"$mysql_dump_file\" ; echo $?`;
+	system("mysqldump --defaults-extra-file=\"$passfile\" --all-databases --add-drop-database --add-drop-table --single-transaction > \"$mysql_dump_file\" 2>/dev/null");
+	$myexit=$? >> 8;
+        # print "finish db\n";
     }
     else {
 	# ugly, but allows us to check exit codes of both piped commands, rather than just the last
 	$myexit=`mysqldump --defaults-extra-file=\"$passfile\" --all-databases | $mysql_compress > \"$mysql_dump_file\" ; expr \$(echo \${PIPESTATUS[\@]} | sed 's/ / + /g')`;
     }
-    # did it work?
+    # did it work? check both exit value and that the file exists and has data in it.
     chomp $myexit;
-    if ( $myexit eq 0 ) {
-	log_it "Finished dumping mysql database.";
+    if ( not -s $mysql_dump_file ) {
+	log_exit "Failed to dump mysql database: it dumped an empty file, or no file at all.";
+    }
+    elsif ( $myexit ne 0  ) {
+	log_exit "Failed to dump mysql database. Exit code $myexit.";	
     }
     else {
-	# still have to cleanup
-	log_exit "Failed to dump mysql database. Exit code $myexit.";
+	log_it "Finished dumping mysql database of " . (stat($mysql_dump_file))[7] . " bytes.";
     }
     system("sync");
     
