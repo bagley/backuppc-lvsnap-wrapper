@@ -688,13 +688,9 @@ log_it("Recieved backup request: $ssh_command");
 if ( $use_chroot ) {
     my $lock_msg=0;
     open(LOCK,"<",$0) or die "Cannot open $0 for locking: $!";
-    while ( not flock(LOCK, LOCK_EX|LOCK_NB) ) {
-        if ( $lock_msg == 0 ) {
-            $lock_msg=1;
-	    log_it "A backup is currently running. Waiting for it to stop";
-        }
-        # wait a bit and try again. log only logs first message.
-        sleep 120;
+    if ( not flock(LOCK, LOCK_EX|LOCK_NB) ) {
+        log_it "A backup is currently running. Exiting so other backups can run.";
+	exit 1;
     }
 }
 
