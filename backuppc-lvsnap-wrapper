@@ -40,6 +40,10 @@ our $mounts_under_chroot=-1;
 # Backup Priority (nice)
 our $nice=3;
 
+# Lock file
+our $lock_file='/var/run/backuppc-lvsnap-wrapper.pid';
+our $lock_h=undef;
+
 # Services
 our $stop_services='';
 our $init="/etc/init.d";
@@ -237,6 +241,120 @@ if ( $nice > 0 ) {
 }
 
 
+
+##########
+#
+# locks
+#
+##########
+
+sub save_pid_to_lock_file {
+    # open lock file (
+    lock_the_lock_file();
+    # write our pid to file
+    seek($lock_h,0,2); # end of file
+    print $lock_h $$ . "\n" || log_exit "Failed to write our pid to $lock_file: $!";
+    # close it up
+    unlock_lock_file();
+}
+
+sub lock_the_lock_file {
+	# create, open, and lock the lock file
+	# make it if not there, err out if unable to make it
+	if ( not defined($lock_h) ) {
+		open($lock_h,"+<",$lock_file) or log_exit "Cannot create or open lock file $lock_file: $!";
+		debug "Openned lock file $lock_file";
+	}
+	chmod 0600, $lock_file;
+    while ( not flock($lock_h, LOCK_EX|LOCK_NB) ) {
+        log_it "Another backup process appears to be performing an important task, like snapshoting. Waiting for it to finish.";
+        sleep 3;
+    }
+}
+
+sub unlock_lock_file {
+	close($lock_h) || log_exit "Failed to close the lock file $lock_file: $!";
+	$lock_h=undef;
+}
+
+# removes the current proccess's pid, and cleans up the pid file
+sub remove_pid_from_lock_file {
+	# open lock file
+	lock_the_lock_file();
+	# get and check pids
+	my @pids=();
+	seek($lock_h,0,0);
+	foreach (<$lock_h>) {
+		my $pid=$_;
+		chomp $pid;
+		push @pids, $_;
+	}
+	my @running_pids=get_running_process_list(@pids);
+	# print out the final thing
+	seek($lock_h,0,0);
+	truncate($lock_h,0);
+	foreach (@running_pids) {
+		debug("Saved pid $_");
+		print $lock_h $_ . "\n";
+	}
+	# close it up
+	unlock_lock_file();
+}
+
+sub get_running_process_list {
+	my @pids = @_;
+	my @are_running;
+	foreach (@pids) {
+		my $pid = $_;
+		chomp $pid;
+		next if ( $pid =~ m/^\s*$/ );
+		# debug "checking $pid";
+		# disregard ours
+		if ( $pid == $$ ) {
+			debug "Ignoring our pid $$";
+			next;
+		}
+		# disregard others that aren't running
+		if ( not kill(0,$pid) ) {
+			debug "Ignoring dead process pid $pid.";
+			next;
+		}
+		# is it a right process. check that it has $0 in the name
+		my $pid_ret=`ps --no-headers -p $pid -o comm,args`;
+		chomp $pid_ret;
+		if ( not $pid_ret =~ m/.*test.pl.*/ ) {
+			debug "Process $pid is running, but does look like one of ours";
+			next;
+		}
+		# save it
+		push @are_running, $pid;
+	}
+	return @are_running + 1;
+}
+		
+
+# returns number of *other* backups running
+sub is_another_instance_running {
+	# open lock file and lock it
+	lock_the_lock_file();
+	# read pids, disregard ours, and check if others are running
+	seek($lock_h,0,0);
+	my @pids=();
+	foreach (<$lock_h>) {
+		my $pid=$_;
+		chomp $pid;
+		push @pids, $_;
+	}
+	my @pids_running=get_running_process_list(@pids);
+	# unlock
+	unlock_lock_file();
+	# how many were running?
+	return $#pids_running;
+}
+
+
+
+
 ##########
 # services
 
@@ -286,6 +404,10 @@ sub services {
 	}
     }
 }
+
+
+
+
 
 ############
 # databases
@@ -586,6 +708,26 @@ sub do_cleanup {
         kill TERM => -$$;
 	sleep 2;
     }
+    
+    # if another backup is already running, leave the snapshot, database, and
+    # other things for it to clean up
+    if ( is_another_instance_running() > 0 ) {
+	log_it "Another backup is still running. Leaving snapshot\n";
+	
+        # remove pid from pid file
+	remove_pid_from_lock_file();
+	
+        # to exit, or not to exit...
+        if ( $sig eq "INT" or $sig eq "HUP" or $sig eq "TERM" or $sig eq "ALRM" ) {
+           # do not use log_exit, as it will loop
+	   log_it "Exiting due to signal $sig";
+	   exit 1;
+        }
+	
+	log_it("Exiting");
+	exit 0;
+    }
+    
     # stop lvm, dumps, etc
     if ( $use_chroot ) {
 	log_it("Cleaning up snapshots");
@@ -633,11 +775,7 @@ sub do_cleanup {
 	    exit 1; # dont quite know if this is right...
         }
     }
-    
-    # remove lock
-    # we could do it here, but may a well just close program and be done with it
-    # (we are locking the the source code - ourself)
-    
+        
     # to exit, or not to exit...
     if ( $sig eq "INT" or $sig eq "HUP" or $sig eq "TERM" or $sig eq "ALRM" ) {
         # do not use log_exit, as it will loop
@@ -715,16 +853,13 @@ if ( $ssh_command =~ m/.*--timeout=0.*/ ) {
 # Proceed with snapshot / backup
 log_it("Recieved backup request: $ssh_command");
 
-# get lock by placing a read lock on ourself
-# we only need this if we are doing chroots, as normal usage should be fine
-if ( $use_chroot ) {
-    my $lock_msg=0;
-    open(LOCK,"<",$0) or die "Cannot open $0 for locking: $!";
-    if ( not flock(LOCK, LOCK_EX|LOCK_NB) ) {
-        log_it "A backup is currently running. Exiting so other backups can run.";
-	exit 1;
-    }
-}
+# set lock file
+save_pid_to_lock_file();
+
+if ( is_another_instance_running() == 0 ) {
+
+# get exclusive lock for snapshoting
+lock_the_lock_file();
 
 # pre run
 if ($pre_run ne "" ) {
@@ -767,16 +902,21 @@ else {
 
 # now we take the snapshots
 if ( $use_chroot ) {
+    
     # flush and lock databases, if requested
     mysql_lock();
     pgsql_lock();
+    
     # stop services
     services('stop',@services);
+    
     # pre-snapshot
     system("$pre_snapshot") if ( $pre_snapshot ne "" );
+    
     # sync disks
     system("sync");
-    # lvm snapshot
+    
+    # do lvm snapshot
     log_it("Creating snapshots");
     mkdir $chroot_dir || log_exit "Failed to create $chroot_dir";
     system("$snapshot_program start >/dev/null 2>&1");
@@ -794,13 +934,18 @@ if ( $use_chroot ) {
     else {
 	check_mounts();
     }
+    
     # free databases and bring back services
     system("$post_snapshot") if ( $post_snapshot ne "" );
     services('start',@services);
     mysql_unlock();
     pgsql_unlock();
     # TODO: add thread to monitor lvm free space (or should lvsnap do this?)
+    
 }
+
+# let go of exclusive lock (so other backup can now go
+unlock_lock_file();
 
 # do backup
 my $chroot_cmd="";
