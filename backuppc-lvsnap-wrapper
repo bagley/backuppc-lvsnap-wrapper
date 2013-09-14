@@ -243,15 +243,47 @@ if ( $nice > 0 ) {
 sub services {
     my ($action,@s)=@_;
     foreach (@s) {
-        if ( -x "$init/$_" ) {
-	    system ( "$init/$_ $action >/dev/null 2>&1");
-	    if ( $? >> 8 eq 0 ) {
-		log_it "Completed a $action of $_";
-	    }
-	    else {
-		log_it "Failed to do a $action of $_";
-	    }
+	
+	my $_return=0;
+	my $_service=$_;
+	my $_ran="";
+        
+	# try to find out which type and try to run it
+	if ( "$init" == "systemctl" ) {
+	    system ( "$init $action $_service >/dev/null 2>&1");
+	    $_return=$?;
+	    $_ran="$init $action $_service";
+	}
+	
+	elsif ( "$init" == "service" ) {
+	    system ( "service $_service $action >/dev/null 2>&1");
+	    $_return=$?;
+	    $_ran="service $_service $action";
+	}
+        
+	elsif ( -x "$init/$_service" ) {
+	    system ( "$init/$_service $action >/dev/null 2>&1");
+	    $_return=$?;
+	    $_ran="$init/$_service $action";
         }
+	
+	else {
+	    
+	    log_it "Could not identify nor find service method: $init";
+	    $_return=255;
+	    $_ran="unknown init system"
+	    
+	}
+	
+	# now report on it, to save having to put this code on each one.
+	if ( $_return >> 8 eq 0 ) {
+	    log_it "Completed a $action of $_service, using $_ran";
+	}
+	else {
+	    my $_error_code=$_return >> 8;
+	    log_it "Failed to do a $action of $_service, using $_ran. Error code $_error_code";
+	    system("echo \"Failed to $action service $_service using $_ran\" | mail -s BackupPC-lvsnap-wrapper root");
+	}
     }
 }
 
